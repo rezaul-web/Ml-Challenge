@@ -1,0 +1,29 @@
+paths:
+  raw_data_dir: "data/dataset/train"
+  output_dir: "output"
+  train_ground_truth: "data/dataset/train/train_ground_truth.tsv"
+  candidate_pairs: "output/candidate_pairs.tsv"
+  matching_results: "output/matching_results.tsv"
+
+preprocessing:
+  text_columns: ["business_name", "business_address"]
+  id_column: "record_id"
+
+blocking:
+  ngram_range: [3, 3]
+  top_k_candidates: 30
+  similarity_threshold: 0.1
+
+modeling:
+  val_size: 0.2
+  random_state: 42
+  lgbm_params:
+    objective: "binary"
+    metric: "binary_logloss"
+    boosting_type: "gbdt"
+    learning_rate: 0.05
+    num_leaves: 31
+    max_depth: 6
+    feature_fraction: 0.8
+    n_estimators: 200
+    random_state: 42
