@@ -6,12 +6,8 @@ from pathlib import Path
 from rapidfuzz import fuzz, distance
 import lightgbm as lgb
 import re
-
-# ---------------------------------------------------------
-# Person B's Module: Feature Engineering & Matching
-# Responsibilities: Load candidates and raw data, extract string features, train model, output matches.
-# Note: Has its own simple text cleaner to remain completely independent from Person A's module.
-# ---------------------------------------------------------
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import precision_score, recall_score, fbeta_score
 
 def basic_clean(text):
     if pd.isna(text) or not isinstance(text, str): return ""
@@ -71,27 +67,84 @@ def extract_features(candidates_df, df_s1_idx, df_pool_idx, config):
     print(f"[Phase 2] Feature extraction done in {time.time() - start:.2f}s")
     return pd.DataFrame(features)
 
-def train_and_predict(features_df, config):
-    # Dummy implementation for training as actual ground truth processing requires dataset specifics
-    print("[Phase 2] Training matching model (Mock)...")
-    feature_cols = [c for c in features_df.columns if c not in ['source1_id', 'candidate_id']]
-    X = features_df[feature_cols]
+def load_ground_truth(config):
+    gt_path = config['paths']['train_ground_truth']
+    df_gt = pd.read_csv(gt_path, sep="\t", dtype=str)
     
-    # Mocking predictions
-    y_pred = np.random.rand(len(X))
-    best_threshold = 0.8
-    print(f"[Phase 2] Tuned threshold: {best_threshold}")
-    return y_pred, best_threshold
+    true_pairs = set()
+    for _, row in df_gt.iterrows():
+        s1_id = row['source1_entity_id']
+        matched_str = str(row['matched_entity_ids'])
+        if pd.notna(matched_str) and matched_str.strip() != "":
+            matches = [m.strip() for m in matched_str.split(',')]
+            for m in matches:
+                true_pairs.add((s1_id, m))
+    return true_pairs
 
-def generate_submission(features_df, y_pred, threshold, output_path):
+def f05_score(y_true, y_pred):
+    return fbeta_score(y_true, y_pred, beta=0.5, zero_division=1.0)
+
+def train_and_predict(features_df, config):
+    print("[Phase 2] Training matching model...")
+    true_pairs = load_ground_truth(config)
+    
+    # Create target variable
+    features_df['label'] = features_df.apply(
+        lambda row: 1 if (row['source1_id'], row['candidate_id']) in true_pairs else 0, 
+        axis=1
+    )
+    
+    feature_cols = [c for c in features_df.columns if c not in ['source1_id', 'candidate_id', 'label']]
+    X = features_df[feature_cols]
+    y = features_df['label']
+    
+    # Split for threshold tuning
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=config['modeling']['val_size'], random_state=config['modeling']['random_state']
+    )
+    
+    lgb_params = config['modeling']['lgbm_params']
+    train_data = lgb.Dataset(X_train, label=y_train)
+    val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
+    
+    model = lgb.train(
+        lgb_params,
+        train_data,
+        valid_sets=[val_data],
+        callbacks=[lgb.early_stopping(stopping_rounds=50)]
+    )
+    
+    # Tune threshold on validation set
+    y_val_probs = model.predict(X_val)
+    
+    best_thresh = 0.5
+    best_f05 = 0.0
+    for thresh in np.arange(0.1, 0.95, 0.05):
+        preds = (y_val_probs >= thresh).astype(int)
+        f05 = f05_score(y_val, preds)
+        if f05 > best_f05:
+            best_f05 = f05
+            best_thresh = thresh
+            
+    print(f"[Phase 2] Best validation F0.5 = {best_f05:.4f} at threshold = {best_thresh:.2f}")
+    
+    # Predict on all data
+    y_pred_probs = model.predict(X)
+    
+    return y_pred_probs, best_thresh
+
+def generate_submission(features_df, y_pred, threshold, df_s1_idx, output_path):
     features_df['pred_prob'] = y_pred
     matches = features_df[features_df['pred_prob'] >= threshold]
     
     submission_records = []
-    for s1_id in features_df['source1_id'].unique():
+    # Ensure all s1_ids from the original source1 are present (even singletons)
+    all_s1_ids = df_s1_idx.index.unique()
+    
+    for s1_id in all_s1_ids:
         s1_matches = matches[matches['source1_id'] == s1_id]['candidate_id'].tolist()
         match_str = ",".join(map(str, set(s1_matches))) if s1_matches else ""
-        submission_records.append({'source1_id': s1_id, 'matched_ids': match_str})
+        submission_records.append({'source1_entity_id': s1_id, 'matched_entity_ids': match_str})
         
     sub_df = pd.DataFrame(submission_records)
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -99,17 +152,18 @@ def generate_submission(features_df, y_pred, threshold, output_path):
     print(f"[Phase 2] Final matches saved to {output_path}")
 
 def run_matching_pipeline(config):
-    candidates_path = config['paths']['candidate_pairs']
+    # Use the internal candidate pairs file generated by Phase 1
+    candidates_path = str(config['paths']['candidate_pairs']).replace('candidate_pairs.tsv', 'internal_candidate_pairs.tsv')
     try:
         candidates_df = pd.read_csv(candidates_path, sep="\t")
     except FileNotFoundError:
-        print(f"[Phase 2 Error] {candidates_path} not found. Person A needs to run Candidate Generation first.")
+        print(f"[Phase 2 Error] {candidates_path} not found. Please run Candidate Generation first.")
         return False
         
     df_s1_idx, df_pool_idx = load_data_for_features(config)
     features_df = extract_features(candidates_df, df_s1_idx, df_pool_idx, config)
     y_pred, threshold = train_and_predict(features_df, config)
-    generate_submission(features_df, y_pred, threshold, config['paths']['matching_results'])
+    generate_submission(features_df, y_pred, threshold, df_s1_idx, config['paths']['matching_results'])
     return True
 
 if __name__ == "__main__":

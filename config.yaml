@@ -7,7 +7,7 @@ paths:
 
 preprocessing:
   text_columns: ["business_name", "business_address"]
-  id_column: "record_id"
+  id_column: "entity_id"
 
 blocking:
   ngram_range: [3, 3]
